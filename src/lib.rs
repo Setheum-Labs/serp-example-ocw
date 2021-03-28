@@ -1,5 +1,7 @@
 //! In this example we are going to build a very simplistic, naive and definitely NOT
-//! production-ready oracle forJUSD/USD price.
+//! production-ready oracle for DNAR/USD, SETT/USD and JUSD/USD prices. 
+//! The BTC here represents DNAR since DNAR is not yet listed in the market.
+//! The USDT here represents SETT since SETT is not yet listed in the market.
 //! The DAI here represents JUSD since JUSD is not yet listed in the market.
 //! Offchain Worker (OCW) will be triggered after every block, fetch the current price
 //! and prepare either signed or unsigned transaction to feed the result back on chain.
@@ -20,7 +22,7 @@ use frame_system::{
 	}
 };
 use frame_support::{
-	debug,
+	debug, debug::native,
 	dispatch::DispatchResult, decl_module, decl_storage, decl_event,
 	traits::Get,
 };
@@ -28,14 +30,14 @@ use sp_core::crypto::KeyTypeId;
 use sp_runtime::{
 	RuntimeDebug,
 	offchain::{http, Duration, storage::StorageValueRef},
-	traits::Zero,
+	traits::Zero, 
 	transaction_validity::{
 		InvalidTransaction, ValidTransaction, TransactionValidity, TransactionSource,
 		TransactionPriority,
 	},
 };
 use codec::{Encode, Decode};
-use sp_std::vec::Vec;
+use sp_std::{vec::Vec};
 use lite_json::json::JsonValue;
 
 #[cfg(test)]
@@ -99,6 +101,7 @@ pub trait Trait: CreateSignedTransaction<Call<Self>> {
 	/// This is exposed so that it can be tuned for particular runtime, when
 	/// multiple pallets send unsigned transactions.
 	type UnsignedPriority: Get<TransactionPriority>;
+
 }
 
 /// Payload used by this example crate to hold price
@@ -106,7 +109,7 @@ pub trait Trait: CreateSignedTransaction<Call<Self>> {
 #[derive(Encode, Decode, Clone, PartialEq, Eq, RuntimeDebug)]
 pub struct PricePayload<Public, BlockNumber> {
 	block_number: BlockNumber,
-	price: u32,
+	price: u64,
 	public: Public,
 }
 
@@ -121,7 +124,9 @@ decl_storage! {
 		/// A vector of recently submitted prices.
 		///
 		/// This is used to calculate average price, should have bounded size.
-		Prices get(fn prices): Vec<u32>;
+		Prices get(fn prices): Vec<u64>;
+		/// This is used to get the price returned by the ocw.
+		Price get(fn get_price): u64 = 1_000;
 		/// Defines the block when next unsigned transaction will be accepted.
 		///
 		/// To prevent spam of unsigned (and unpayed!) transactions on the network,
@@ -136,7 +141,8 @@ decl_event!(
 	pub enum Event<T> where AccountId = <T as frame_system::Trait>::AccountId {
 		/// Event generated when new price is accepted to contribute to the average.
 		/// \[price, who\]
-		NewPrice(u32, AccountId),
+		NewPrice(u64, AccountId),
+		NewPriceIn(u64),
 	}
 );
 
@@ -160,7 +166,7 @@ decl_module! {
 		/// This example is not focused on correctness of the oracle itself, but rather its
 		/// purpose is to showcase offchain worker capabilities.
 		#[weight = 0]
-		pub fn submit_price(origin, price: u32) -> DispatchResult {
+		pub fn submit_price(origin, price: u64) -> DispatchResult {
 			// Retrieve sender of the transaction.
 			let who = ensure_signed(origin)?;
 			// Add the price to the on-chain list.
@@ -185,7 +191,7 @@ decl_module! {
 		/// This example is not focused on correctness of the oracle itself, but rather its
 		/// purpose is to showcase offchain worker capabilities.
 		#[weight = 0]
-		pub fn submit_price_unsigned(origin, _block_number: T::BlockNumber, price: u32)
+		pub fn submit_price_unsigned(origin, _block_number: T::BlockNumber, price: u64)
 			-> DispatchResult
 		{
 			// This ensures that the function can only be called via unsigned transaction.
@@ -245,7 +251,7 @@ decl_module! {
 			// of the code to separate `impl` block.
 			// Here we call a helper function to calculate current average price.
 			// This function reads storage entries of the current state.
-			let average: Option<u32> = Self::average_price();
+			let average: Option<u64> = Self::average_price();
 			debug::debug!("Current price: {:?}", average);
 
 			// For this example we are going to send both signed and unsigned transactions
@@ -263,6 +269,43 @@ decl_module! {
 				debug::error!("Error: {}", e);
 			}
 		}
+		
+		#[weight = 0]
+        pub fn set_price(origin, new_price: u64) -> DispatchResult {
+            let _who = ensure_signed(origin)?;
+
+            Price::put(new_price);
+
+            Self::deposit_event(RawEvent::NewPriceIn(new_price));
+
+            Ok(())
+        }
+
+		#[weight = 0]
+        pub fn get_sett_price(origin) -> DispatchResult {
+            let _who = ensure_signed(origin)?;
+            let price = <Self as FetchPriceFor>::fetch_sett_price().unwrap();
+
+            native::info!("SETT offchain price: {}", price);
+            Price::put(price);
+
+            Self::deposit_event(RawEvent::NewPriceIn(price));
+
+            Ok(())
+        }
+
+        #[weight = 0]
+        pub fn get_jusd_price(origin) -> DispatchResult {
+            let _who = ensure_signed(origin)?;
+            let price = <Self as FetchPriceFor>::fetch_jusd_price().unwrap();
+
+            native::info!("JUSD offchain price: {}", price);
+            Price::put(price);
+
+            Self::deposit_event(RawEvent::NewPriceIn(price));
+
+            Ok(())
+        }
 	}
 }
 
@@ -272,6 +315,170 @@ enum TransactionType {
 	UnsignedForAll,
 	Raw,
 	None,
+}
+
+pub trait FetchPrice<U64> {
+	/// Fetch the current price.
+	fn fetch_price() -> u64;
+}
+
+impl<T: Trait> FetchPrice<u64> for Module<T> {
+    fn fetch_price() -> u64 {
+        Self::get_price()
+    }
+}
+
+pub trait FetchPriceFor {
+	fn fetch_dinar_price() -> Result<u64, http::Error>;
+    fn fetch_sett_price() -> Result<u64, http::Error>;
+	fn fetch_jusd_price() -> Result<u64, http::Error>;
+	fn parse_price(price_str: &str) -> Option<u64>;
+}
+
+/// Fetch current price and return the result in cents.
+impl<T: Trait> FetchPriceFor for Module<T> {
+
+	/// Fetch current price of SETT and return the result in cents.
+	fn fetch_dinar_price() -> Result<u64, http::Error> {
+		let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
+		let request = http::Request::get(
+			"https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD"
+		);
+		let pending = request
+			.deadline(deadline)
+			.send()
+			.map_err(|_| http::Error::IoError)?;
+
+		let response = pending.try_wait(deadline)
+			.map_err(|_| http::Error::DeadlineReached)??;
+		// Let's check the status code before we proceed to reading the response.
+		if response.code != 200 {
+			debug::warn!("Unexpected status code: {}", response.code);
+			return Err(http::Error::Unknown);
+		}
+
+		let body = response.body().collect::<Vec<u8>>();
+
+		// Create a str slice from the body.
+		let body_str = sp_std::str::from_utf8(&body).map_err(|_| {
+			debug::warn!("No UTF8 body");
+			http::Error::Unknown
+		})?;
+
+		let price = match Self::parse_price(body_str) {
+			Some(price) => Ok(price),
+			None => {
+				debug::warn!("Unable to extract price from the response: {:?}", body_str);
+				Err(http::Error::Unknown)
+			}
+		}?;
+
+		debug::warn!("Got price: {} cents", price);
+
+		Ok(price)
+	}
+
+	/// Fetch current price of SETT and return the result in cents.
+	fn fetch_sett_price() -> Result<u64, http::Error> {
+		let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
+		let request = http::Request::get(
+			"https://min-api.cryptocompare.com/data/price?fsym=USDT&tsyms=USD"
+		);
+		let pending = request
+			.deadline(deadline)
+			.send()
+			.map_err(|_| http::Error::IoError)?;
+
+		let response = pending.try_wait(deadline)
+			.map_err(|_| http::Error::DeadlineReached)??;
+		// Let's check the status code before we proceed to reading the response.
+		if response.code != 200 {
+			debug::warn!("Unexpected status code: {}", response.code);
+			return Err(http::Error::Unknown);
+		}
+
+		let body = response.body().collect::<Vec<u8>>();
+
+		// Create a str slice from the body.
+		let body_str = sp_std::str::from_utf8(&body).map_err(|_| {
+			debug::warn!("No UTF8 body");
+			http::Error::Unknown
+		})?;
+
+		let price = match Self::parse_price(body_str) {
+			Some(price) => Ok(price),
+			None => {
+				debug::warn!("Unable to extract price from the response: {:?}", body_str);
+				Err(http::Error::Unknown)
+			}
+		}?;
+
+		debug::warn!("Got price: {} cents", price);
+
+		Ok(price)
+	}
+
+	/// Fetch current price of JUSD and return the result in cents.
+	fn fetch_jusd_price() -> Result<u64, http::Error> {
+		let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
+		let request = http::Request::get(
+			"https://min-api.cryptocompare.com/data/price?fsym=DAI&tsyms=USD"
+		);
+		let pending = request
+			.deadline(deadline)
+			.send()
+			.map_err(|_| http::Error::IoError)?;
+
+		let response = pending.try_wait(deadline)
+			.map_err(|_| http::Error::DeadlineReached)??;
+		// Let's check the status code before we proceed to reading the response.
+		if response.code != 200 {
+			debug::warn!("Unexpected status code: {}", response.code);
+			return Err(http::Error::Unknown);
+		}
+
+		let body = response.body().collect::<Vec<u8>>();
+
+		// Create a str slice from the body.
+		let body_str = sp_std::str::from_utf8(&body).map_err(|_| {
+			debug::warn!("No UTF8 body");
+			http::Error::Unknown
+		})?;
+
+		let price = match Self::parse_price(body_str) {
+			Some(price) => Ok(price),
+			None => {
+				debug::warn!("Unable to extract price from the response: {:?}", body_str);
+				Err(http::Error::Unknown)
+			}
+		}?;
+
+		debug::warn!("Got price: {} cents", price);
+
+		Ok(price)
+	}
+
+	/// Parse the price from the given JSON string using `lite-json`.
+	///
+	/// Returns `None` when parsing failed or `Some(price in cents)` when parsing is successful.
+	fn parse_price(price_str: &str) -> Option<u64> {
+		let val = lite_json::parse_json(price_str);
+		let price = val.ok().and_then(|v| match v {
+			JsonValue::Object(obj) => {
+				let mut chars = "USD".chars();
+				obj.into_iter()
+					.find(|(k, _)| k.iter().all(|k| Some(*k) == chars.next()))
+					.and_then(|v| match v.1 {
+						JsonValue::Number(number) => Some(number),
+						_ => None,
+					})
+			},
+			_ => None
+		})?;
+
+		let exp = price.fraction_length.checked_sub(2).unwrap_or(0);
+		Some(price.integer as u64 * 100 + (price.fraction / 10_u64.pow(exp)) as u64)
+	}
 }
 
 /// Most of the functions are moved outside of the `decl_module!` macro.
@@ -481,7 +688,7 @@ impl<T: Trait> Module<T> {
 	}
 
 	/// Fetch current price and return the result in cents.
-	fn fetch_price() -> Result<u32, http::Error> {
+	fn fetch_price() -> Result<u64, http::Error> {
 		// We want to keep the offchain worker execution time reasonable, so we set a hard-coded
 		// deadline to 2s to complete the external call.
 		// You can also wait idefinitely for the response, however you may still get a timeout
@@ -489,9 +696,10 @@ impl<T: Trait> Module<T> {
 		let deadline = sp_io::offchain::timestamp().add(Duration::from_millis(2_000));
 		// Initiate an external HTTP GET request.
 		// This is using high-level wrappers from `sp_runtime`, for the low-level calls that
-		// you can find in `sp_io`. The API is trying to be similar to `reqwest`, but
+		// you can find in `sp_io`. The API is trying to be similar to `request`, but
 		// since we are running in a custom WASM execution environment we can't simply
 		// import the library here.
+
 		let request = http::Request::get(
 			"https://min-api.cryptocompare.com/data/price?fsym=DAI&tsyms=USD"
 		);
@@ -544,7 +752,7 @@ impl<T: Trait> Module<T> {
 	/// Parse the price from the given JSON string using `lite-json`.
 	///
 	/// Returns `None` when parsing failed or `Some(price in cents)` when parsing is successful.
-	fn parse_price(price_str: &str) -> Option<u32> {
+	fn parse_price(price_str: &str) -> Option<u64> {
 		let val = lite_json::parse_json(price_str);
 		let price = val.ok().and_then(|v| match v {
 			JsonValue::Object(obj) => {
@@ -560,11 +768,11 @@ impl<T: Trait> Module<T> {
 		})?;
 
 		let exp = price.fraction_length.checked_sub(2).unwrap_or(0);
-		Some(price.integer as u32 * 100 + (price.fraction / 10_u64.pow(exp)) as u32)
+		Some(price.integer as u64 * 100 + (price.fraction / 10_u64.pow(exp)) as u64)
 	}
 
 	/// Add new price to the list.
-	fn add_price(who: T::AccountId, price: u32) {
+	fn add_price(who: T::AccountId, price: u64) {
 		debug::info!("Adding to the average: {}", price);
 		Prices::mutate(|prices| {
 			const MAX_LEN: usize = 64;
@@ -584,18 +792,18 @@ impl<T: Trait> Module<T> {
 	}
 
 	/// Calculate current average price.
-	fn average_price() -> Option<u32> {
+	fn average_price() -> Option<u64> {
 		let prices = Prices::get();
 		if prices.is_empty() {
 			None
 		} else {
-			Some(prices.iter().fold(0_u32, |a, b| a.saturating_add(*b)) / prices.len() as u32)
+			Some(prices.iter().fold(0_u64, |a, b| a.saturating_add(*b)) / prices.len() as u64)
 		}
 	}
 
 	fn validate_transaction_parameters(
 		block_number: &T::BlockNumber,
-		new_price: &u32,
+		new_price: &u64,
 	) -> TransactionValidity {
 		// Now let's check if the transaction has any chance to succeed.
 		let next_unsigned_at = <NextUnsignedAt<T>>::get();
